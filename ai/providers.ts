@@ -6,7 +6,6 @@ import {
 } from "ai";
 
 const languageModels = {
-  "kimi-k2": groq("moonshotai/kimi-k2-instruct"),
   "meta-llama/llama-4-scout-17b-16e-instruct": groq(
     "meta-llama/llama-4-scout-17b-16e-instruct",
   ),
@@ -28,4 +27,4 @@ export type modelID = keyof typeof languageModels;
 
 export const MODELS = Object.keys(languageModels);
 
-export const defaultModel: modelID = "kimi-k2";
+export const defaultModel: modelID = "llama-3.3-70b-versatile";
