@@ -1,0 +1,24 @@
+name: Deploy to Vercel
+
+on:
+  push:
+    branches: [main]
+    # Only triggers when commit message contains [deploy]
+    # Example: "fix: update prompt [deploy]"
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # For push events: only run if commit message contains [deploy]
+    # For PR merges and manual triggers: always run
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request' && github.event.pull_request.merged == true ||
+      github.event_name == 'push' && contains(github.event.head_commit.message, '[deploy]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Vercel Deploy
+        run: curl -X POST "${{ secrets.VERCEL_DEPLOY_HOOK }}"
