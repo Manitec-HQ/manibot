@@ -1,11 +1,11 @@
 import { model, modelID } from "@/ai/providers";
-import { weatherTool } from "@/ai/tools";
+import { weatherTool, kairosSearchTool } from "@/ai/tools";
 import { convertToModelMessages, stepCountIs, streamText, UIMessage } from "ai";
 import fs from "fs";
 import path from "path";
 import { NextRequest } from "next/server";
 
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 const SYSTEM_PROMPT = fs.readFileSync(
   path.join(process.cwd(), "prompts", "manibot-system.md"),
@@ -14,10 +14,6 @@ const SYSTEM_PROMPT = fs.readFileSync(
 
 // ---------------------------------------------------------------------------
 // In-memory rate limiter
-// Tracks requests per IP using two sliding windows: per-minute and per-hour.
-// Good-enough abuse prevention for a single-instance serverless function.
-// NOTE: resets on cold start — not perfectly accurate across instances,
-// but will reliably catch hammering scripts within a warm execution context.
 // ---------------------------------------------------------------------------
 
 const RATE_LIMIT_PER_MINUTE = 10;
@@ -47,17 +43,14 @@ function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
     hour: { count: 0, windowStart: now },
   };
 
-  // Reset minute window if expired
   if (now - entry.minute.windowStart > ONE_MINUTE_MS) {
     entry.minute = { count: 0, windowStart: now };
   }
 
-  // Reset hour window if expired
   if (now - entry.hour.windowStart > ONE_HOUR_MS) {
     entry.hour = { count: 0, windowStart: now };
   }
 
-  // Check limits before incrementing
   if (entry.minute.count >= RATE_LIMIT_PER_MINUTE) {
     rateLimitMap.set(ip, entry);
     return { allowed: false, reason: "minute" };
@@ -68,7 +61,6 @@ function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
     return { allowed: false, reason: "hour" };
   }
 
-  // Increment and save
   entry.minute.count++;
   entry.hour.count++;
   rateLimitMap.set(ip, entry);
@@ -76,7 +68,6 @@ function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
   return { allowed: true };
 }
 
-// Prevent the map from growing unbounded — prune stale IPs every 100 requests
 let pruneCounter = 0;
 function maybePrune() {
   if (++pruneCounter < 100) return;
@@ -95,7 +86,6 @@ function maybePrune() {
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
-  // Rate limit check
   const ip = getIP(req);
   maybePrune();
   const { allowed, reason } = checkRateLimit(ip);
@@ -123,6 +113,7 @@ export async function POST(req: NextRequest) {
     stopWhen: stepCountIs(5),
     tools: {
       getWeather: weatherTool,
+      kairosSearch: kairosSearchTool,
     },
     experimental_telemetry: {
       isEnabled: false,
