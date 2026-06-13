@@ -8,7 +8,6 @@ import { ProjectOverview } from "./project-overview";
 import { Messages } from "./messages";
 import { Header } from "./header";
 import { toast } from "sonner";
-import { nanoid } from "nanoid";
 
 interface ChatProps {
   sessionId: string;
@@ -28,7 +27,6 @@ export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatPr
   const [selectedModel, setSelectedModel] = useState<modelID>(defaultModel);
   const [loaded, setLoaded] = useState(false);
   const hasRestored = useRef(false);
-  const sessionCreated = useRef(false);
 
   const { sendMessage, messages, setMessages, status, stop } = useChat({
     onError: (error) => {
@@ -41,18 +39,19 @@ export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatPr
     },
   });
 
+  // Reset when session changes
   useEffect(() => {
     hasRestored.current = false;
-    sessionCreated.current = false;
     setMessages([]);
     setLoaded(false);
   }, [sessionId, setMessages]);
 
+  // Restore messages from Firestore on session load
   useEffect(() => {
     if (hasRestored.current) return;
     hasRestored.current = true;
 
-    fetch(`/api/sessions/${sessionId}`)
+    fetch(`/api/messages?sessionId=${encodeURIComponent(sessionId)}`)
       .then(res => res.json())
       .then(data => {
         if (Array.isArray(data) && data.length > 0) {
@@ -68,43 +67,14 @@ export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatPr
       .finally(() => setLoaded(true));
   }, [sessionId, setMessages]);
 
-  useEffect(() => {
-    if (!loaded || messages.length === 0) return;
-
-    if (!sessionCreated.current) {
-      sessionCreated.current = true;
-      const firstUserMsg = messages.find(m => m.role === "user");
-      const title = firstUserMsg
-        ? getTextContent(firstUserMsg.parts as { type: string; text?: string }[]).slice(0, 40)
-        : "New Chat";
-
-      fetch("/api/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: sessionId, title }),
-      }).catch(() => {});
-    }
-
-    const last = messages[messages.length - 1];
-    if (last && (status === "ready" || status === "error")) {
-      const textContent = getTextContent(last.parts as { type: string; text?: string }[]);
-      fetch("/api/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: last.id ?? nanoid(),
-          sessionId,
-          role: last.role,
-          content: textContent || JSON.stringify(last.parts),
-        }),
-      }).catch(() => {});
-    }
-  }, [messages, loaded, sessionId, status]);
-
   const isLoading = status === "streaming" || status === "submitted";
 
   const handleClearHistory = async () => {
-    await fetch(`/api/sessions/${sessionId}`, { method: "DELETE" });
+    await fetch("/api/sessions", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: sessionId }),
+    });
     setMessages([]);
     toast.success("Chat history cleared.", { position: "top-center" });
   };
@@ -132,7 +102,8 @@ export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatPr
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            sendMessage({ text: input }, { body: { selectedModel } });
+            // Pass sessionId so the server can persist under the correct doc
+            sendMessage({ text: input }, { body: { selectedModel, sessionId } });
             setInput("");
           }}
           className="w-full max-w-xl mx-auto px-4 sm:px-0"
