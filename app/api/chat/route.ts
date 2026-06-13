@@ -95,19 +95,22 @@ interface TextPart {
   text?: string;
 }
 
-function extractText(content: string | TextPart[]): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.filter((p) => p.type === "text").map((p) => p.text ?? "").join("");
-  }
-  return "";
+function extractTextFromParts(parts: TextPart[]): string {
+  return parts.filter((p) => p.type === "text").map((p) => p.text ?? "").join("");
 }
 
 function deriveTitle(messages: UIMessage[]): string {
   const first = messages.find((m) => m.role === "user");
-  if (!first) return "New conversation";
-  const text = extractText(first.content as string | TextPart[]);
+  if (!first || !Array.isArray(first.parts)) return "New conversation";
+  const text = extractTextFromParts(first.parts as TextPart[]);
   return text.trim().slice(0, 60) || "New conversation";
+}
+
+function extractMessageText(m: UIMessage): string {
+  if (Array.isArray(m.parts)) {
+    return extractTextFromParts(m.parts as TextPart[]);
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -154,9 +157,9 @@ export async function POST(req: NextRequest) {
           ...messages
             .filter((m) => m.role === "user" || m.role === "assistant")
             .map((m) => ({
-              id: (m as UIMessage & { id?: string }).id ?? nanoid(),
+              id: m.id ?? nanoid(),
               role: m.role as "user" | "assistant",
-              content: extractText(m.content as string | TextPart[]),
+              content: extractMessageText(m),
               createdAt: Date.now(),
             })),
           {
