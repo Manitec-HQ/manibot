@@ -1,6 +1,9 @@
 import { model, modelID } from "@/ai/providers";
 import { weatherTool, kairosSearchTool } from "@/ai/tools";
 import { convertToModelMessages, stepCountIs, streamText, UIMessage } from "ai";
+import { upsertSession } from "@/lib/manibot-session";
+import type { ManiMessage } from "@/lib/manibot-session";
+import { nanoid } from "nanoid";
 import fs from "fs";
 import path from "path";
 import { NextRequest } from "next/server";
@@ -84,6 +87,21 @@ function maybePrune() {
 }
 
 // ---------------------------------------------------------------------------
+// Derive a session title from the first user message
+// ---------------------------------------------------------------------------
+
+function deriveTitle(messages: UIMessage[]): string {
+  const first = messages.find((m) => m.role === "user");
+  if (!first) return "New conversation";
+  const text = typeof first.content === "string"
+    ? first.content
+    : Array.isArray(first.content)
+      ? (first.content as any[]).filter((p) => p.type === "text").map((p: any) => p.text).join(" ")
+      : "New conversation";
+  return text.trim().slice(0, 60) || "New conversation";
+}
+
+// ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
   const ip = getIP(req);
@@ -104,7 +122,10 @@ export async function POST(req: NextRequest) {
   const {
     messages,
     selectedModel,
-  }: { messages: UIMessage[]; selectedModel: modelID } = await req.json();
+    sessionId,
+  }: { messages: UIMessage[]; selectedModel: modelID; sessionId?: string } = await req.json();
+
+  const resolvedSessionId = sessionId ?? nanoid();
 
   const result = streamText({
     model: model.languageModel(selectedModel),
@@ -117,6 +138,41 @@ export async function POST(req: NextRequest) {
     },
     experimental_telemetry: {
       isEnabled: false,
+    },
+    onFinish: async ({ text }) => {
+      try {
+        // Build the full message list from what was sent + the new assistant reply
+        const persisted: ManiMessage[] = [
+          ...messages
+            .filter((m) => m.role === "user" || m.role === "assistant")
+            .map((m) => ({
+              id: (m as any).id ?? nanoid(),
+              role: m.role as "user" | "assistant",
+              content:
+                typeof m.content === "string"
+                  ? m.content
+                  : Array.isArray(m.content)
+                    ? (m.content as any[])
+                        .filter((p) => p.type === "text")
+                        .map((p: any) => p.text)
+                        .join("")
+                    : "",
+              createdAt: Date.now(),
+            })),
+          {
+            id: nanoid(),
+            role: "assistant",
+            content: text,
+            createdAt: Date.now(),
+          },
+        ];
+
+        const title = deriveTitle(messages);
+        await upsertSession(resolvedSessionId, title, persisted);
+      } catch (err) {
+        // Non-fatal — don't break the stream if Firestore write fails
+        console.error("[manibot] onFinish Firestore write failed:", err);
+      }
     },
   });
 
