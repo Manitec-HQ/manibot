@@ -15,13 +15,6 @@ interface ChatProps {
   sidebarOpen?: boolean;
 }
 
-function getTextContent(parts: { type: string; text?: string }[]): string {
-  return parts
-    .filter(p => p.type === "text")
-    .map(p => p.text ?? "")
-    .join("");
-}
-
 export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatProps) {
   const [input, setInput] = useState("");
   const [selectedModel, setSelectedModel] = useState<modelID>(defaultModel);
@@ -39,14 +32,12 @@ export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatPr
     },
   });
 
-  // Reset when session changes
   useEffect(() => {
     hasRestored.current = false;
     setMessages([]);
     setLoaded(false);
   }, [sessionId, setMessages]);
 
-  // Restore messages from Firestore on session load
   useEffect(() => {
     if (hasRestored.current) return;
     hasRestored.current = true;
@@ -102,7 +93,6 @@ export default function Chat({ sessionId, onToggleSidebar, sidebarOpen }: ChatPr
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            // Pass sessionId so the server can persist under the correct doc
             sendMessage({ text: input }, { body: { selectedModel, sessionId } });
             setInput("");
           }}

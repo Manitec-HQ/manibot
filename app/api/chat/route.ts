@@ -87,17 +87,26 @@ function maybePrune() {
 }
 
 // ---------------------------------------------------------------------------
-// Derive a session title from the first user message
+// Helpers
 // ---------------------------------------------------------------------------
+
+interface TextPart {
+  type: string;
+  text?: string;
+}
+
+function extractText(content: string | TextPart[]): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter((p) => p.type === "text").map((p) => p.text ?? "").join("");
+  }
+  return "";
+}
 
 function deriveTitle(messages: UIMessage[]): string {
   const first = messages.find((m) => m.role === "user");
   if (!first) return "New conversation";
-  const text = typeof first.content === "string"
-    ? first.content
-    : Array.isArray(first.content)
-      ? (first.content as any[]).filter((p) => p.type === "text").map((p: any) => p.text).join(" ")
-      : "New conversation";
+  const text = extractText(first.content as string | TextPart[]);
   return text.trim().slice(0, 60) || "New conversation";
 }
 
@@ -141,27 +150,18 @@ export async function POST(req: NextRequest) {
     },
     onFinish: async ({ text }) => {
       try {
-        // Build the full message list from what was sent + the new assistant reply
         const persisted: ManiMessage[] = [
           ...messages
             .filter((m) => m.role === "user" || m.role === "assistant")
             .map((m) => ({
-              id: (m as any).id ?? nanoid(),
+              id: (m as UIMessage & { id?: string }).id ?? nanoid(),
               role: m.role as "user" | "assistant",
-              content:
-                typeof m.content === "string"
-                  ? m.content
-                  : Array.isArray(m.content)
-                    ? (m.content as any[])
-                        .filter((p) => p.type === "text")
-                        .map((p: any) => p.text)
-                        .join("")
-                    : "",
+              content: extractText(m.content as string | TextPart[]),
               createdAt: Date.now(),
             })),
           {
             id: nanoid(),
-            role: "assistant",
+            role: "assistant" as const,
             content: text,
             createdAt: Date.now(),
           },
@@ -170,7 +170,6 @@ export async function POST(req: NextRequest) {
         const title = deriveTitle(messages);
         await upsertSession(resolvedSessionId, title, persisted);
       } catch (err) {
-        // Non-fatal — don't break the stream if Firestore write fails
         console.error("[manibot] onFinish Firestore write failed:", err);
       }
     },

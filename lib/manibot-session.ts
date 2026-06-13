@@ -3,29 +3,25 @@
  * Firestore persistence for Manibot sessions + messages.
  *
  * Schema:
- *   manibot/sessions/{sessionId}  {
+ *   manibot_sessions/{sessionId}  {
  *     id:         string
  *     title:      string
  *     messages:   ManiMessage[]   (capped at 200)
  *     updatedAt:  Firestore server timestamp
  *     createdAt:  Firestore server timestamp (set on create only)
  *   }
- *
- * No uid — Manibot uses a shared gate password, not per-user auth.
- * Sessions are keyed by sessionId (nanoid, stored in localStorage).
  */
 
 import { getFirebaseAdmin } from "@/lib/firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 
-const SESSIONS_COLLECTION = "manibot/sessions" as const;
 const MESSAGE_CAP = 200;
 
 export interface ManiMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
-  createdAt: number; // unix ms
+  createdAt: number;
 }
 
 export interface ManiSession {
@@ -39,8 +35,6 @@ export interface ManiSession {
 function sessionsCol() {
   const admin = getFirebaseAdmin();
   if (!admin) return null;
-  // Path: manibot (doc) -> sessions (subcollection)
-  // Using a top-level collection pattern: manibot_sessions/{sessionId}
   return admin.db.collection("manibot_sessions");
 }
 
@@ -55,11 +49,11 @@ export async function getSession(sessionId: string): Promise<ManiSession | null>
   if (!snap.exists) return null;
   const d = snap.data()!;
   return {
-    id: d.id,
-    title: d.title,
-    messages: d.messages ?? [],
-    updatedAt: d.updatedAt?.toMillis?.() ?? Date.now(),
-    createdAt: d.createdAt?.toMillis?.() ?? Date.now(),
+    id: d.id as string,
+    title: d.title as string,
+    messages: (d.messages ?? []) as ManiMessage[],
+    updatedAt: (d.updatedAt?.toMillis?.() as number) ?? Date.now(),
+    createdAt: (d.createdAt?.toMillis?.() as number) ?? Date.now(),
   };
 }
 
@@ -70,11 +64,11 @@ export async function getAllSessions(): Promise<ManiSession[]> {
   return snap.docs.map((d) => {
     const data = d.data();
     return {
-      id: data.id,
-      title: data.title,
-      messages: data.messages ?? [],
-      updatedAt: data.updatedAt?.toMillis?.() ?? Date.now(),
-      createdAt: data.createdAt?.toMillis?.() ?? Date.now(),
+      id: data.id as string,
+      title: data.title as string,
+      messages: (data.messages ?? []) as ManiMessage[],
+      updatedAt: (data.updatedAt?.toMillis?.() as number) ?? Date.now(),
+      createdAt: (data.createdAt?.toMillis?.() as number) ?? Date.now(),
     };
   });
 }
@@ -120,7 +114,6 @@ export async function appendMessage(
   const snap = await ref.get();
 
   if (!snap.exists) {
-    // Session doesn't exist yet — create it with this message
     await ref.set({
       id: sessionId,
       title: message.content.slice(0, 60),
@@ -131,7 +124,7 @@ export async function appendMessage(
     return;
   }
 
-  const existing: ManiMessage[] = snap.data()!.messages ?? [];
+  const existing = (snap.data()!.messages ?? []) as ManiMessage[];
   const updated = [...existing, message].slice(-MESSAGE_CAP);
   await ref.update({ messages: updated, updatedAt: FieldValue.serverTimestamp() });
 }

@@ -1,17 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { appendMessage, getSession } from "@/lib/manibot-session";
-import { ManiMessage } from "@/lib/manibot-session";
+import type { ManiMessage } from "@/lib/manibot-session";
 
 export async function POST(req: NextRequest) {
-  const { id, sessionId, role, content } = await req.json();
+  const body = await req.json() as { id: string; sessionId: string; role: string; content: string };
   const message: ManiMessage = {
-    id,
-    sessionId,
-    role,
-    content,
+    id: body.id,
+    role: body.role as "user" | "assistant",
+    content: body.content,
     createdAt: Date.now(),
-  } as any;
-  await appendMessage(sessionId, message);
+  };
+  await appendMessage(body.sessionId, message);
   return NextResponse.json({ ok: true });
 }
 
