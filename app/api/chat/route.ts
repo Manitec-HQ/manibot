@@ -140,15 +140,14 @@ export async function POST(req: NextRequest) {
 
   const {
     messages,
-    _selectedModel,
     sessionId,
-  }: { messages: UIMessage[]; _selectedModel?: modelID; sessionId?: string } = await req.json();
+  }: { messages: UIMessage[]; sessionId?: string } = await req.json();
 
   const resolvedSessionId = sessionId ?? nanoid();
 
   let lastError: unknown = null;
 
-  // Try configured Groq models in order; ignore _selectedModel for now
+  // Try configured Groq models in order
   for (const modelId of GROQ_MODELS) {
     try {
       const result = streamText({
