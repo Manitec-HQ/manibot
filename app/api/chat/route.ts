@@ -1,88 +1,217 @@
-// This is a minimal, non-breaking patch to restore /api/chat by replacing two dead Groq model IDs
-// with a small fallback list of currently available models.
-//
-// Evidence:
-// - Vercel runtime logs show 404 for `meta-llama/llama-4-scout-17b-16e-instruct`.
-// - Vercel runtime logs show 400 `model_decommissioned` for `deepseek-r1-distill-llama-70b`.
-// - Groq catalog (Aug–Sep 2026) lists `meta-llama/llama-3.3-70b-versatile`, `qwen/qwen-3.5-32b`,
-//   and `openai/gpt-oss-20b` as available models.
-//
-// Change:
-// - Introduce a small GROQ_MODELS fallback array.
-// - Try each model in order until one succeeds.
-// - Log which model was actually used for each request.
-
-import { groq } from "@ai-sdk/groq";
-import { streamText } from "ai";
+import { model, modelID } from "@/ai/providers";
+import { weatherTool, kairosSearchTool } from "@/ai/tools";
+import { convertToModelMessages, stepCountIs, streamText, UIMessage } from "ai";
+import { upsertSession } from "@/lib/manibot-session";
+import type { ManiMessage } from "@/lib/manibot-session";
+import { nanoid } from "nanoid";
+import fs from "fs";
+import path from "path";
 import { NextRequest } from "next/server";
-import { z } from "zod";
-import { manibotSessionManager } from "@/lib/manibot-session";
-import { tools } from "@/ai/tools";
+
+export const maxDuration = 60;
+
+const SYSTEM_PROMPT = fs.readFileSync(
+  path.join(process.cwd(), "prompts", "manibot-system.md"),
+  "utf-8"
+);
 
 // Minimal fallback list of available Groq models (Aug–Sep 2026 catalog)
-const GROQ_MODELS = [
+const GROQ_MODELS: modelID[] = [
   "meta-llama/llama-3.3-70b-versatile",
   "qwen/qwen-3.5-32b",
   "openai/gpt-oss-20b",
-] as const;
+];
 
-const chatBodySchema = z.object({
-  message: z.string(),
-  sessionId: z.string().optional(),
-  project: z.string().optional(),
-});
+// ---------------------------------------------------------------------------
+// In-memory rate limiter
+// ---------------------------------------------------------------------------
+
+const RATE_LIMIT_PER_MINUTE = 10;
+const RATE_LIMIT_PER_HOUR = 60;
+const ONE_MINUTE_MS = 60 * 1000;
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+interface RateEntry {
+  minute: { count: number; windowStart: number };
+  hour: { count: number; windowStart: number };
+}
+
+const rateLimitMap = new Map<string, RateEntry>();
+
+function getIP(req: NextRequest): string {
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    req.headers.get("x-real-ip") ??
+    "unknown"
+  );
+}
+
+function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip) ?? {
+    minute: { count: 0, windowStart: now },
+    hour: { count: 0, windowStart: now },
+  };
+
+  if (now - entry.minute.windowStart > ONE_MINUTE_MS) {
+    entry.minute = { count: 0, windowStart: now };
+  }
+
+  if (now - entry.hour.windowStart > ONE_HOUR_MS) {
+    entry.hour = { count: 0, windowStart: now };
+  }
+
+  if (entry.minute.count >= RATE_LIMIT_PER_MINUTE) {
+    rateLimitMap.set(ip, entry);
+    return { allowed: false, reason: "minute" };
+  }
+
+  if (entry.hour.count >= RATE_LIMIT_PER_HOUR) {
+    rateLimitMap.set(ip, entry);
+    return { allowed: false, reason: "hour" };
+  }
+
+  entry.minute.count++;
+  entry.hour.count++;
+  rateLimitMap.set(ip, entry);
+
+  return { allowed: true };
+}
+
+let pruneCounter = 0;
+function maybePrune() {
+  if (++pruneCounter < 100) return;
+  pruneCounter = 0;
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitMap.entries()) {
+    if (
+      now - entry.minute.windowStart > ONE_MINUTE_MS &&
+      now - entry.hour.windowStart > ONE_HOUR_MS
+    ) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+interface TextPart {
+  type: string;
+  text?: string;
+}
+
+function extractTextFromParts(parts: TextPart[]): string {
+  return parts.filter((p) => p.type === "text").map((p) => p.text ?? "").join("");
+}
+
+function deriveTitle(messages: UIMessage[]): string {
+  const first = messages.find((m) => m.role === "user");
+  if (!first || !Array.isArray(first.parts)) return "New conversation";
+  const text = extractTextFromParts(first.parts as TextPart[]);
+  return text.trim().slice(0, 60) || "New conversation";
+}
+
+function extractMessageText(m: UIMessage): string {
+  if (Array.isArray(m.parts)) {
+    return extractTextFromParts(m.parts as TextPart[]);
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const parse = chatBodySchema.safeParse(body);
-  if (!parse.success) {
-    return new Response(JSON.stringify({ error: "Invalid request body" }), {
-      status: 400,
+  const ip = getIP(req);
+  maybePrune();
+  const { allowed, reason } = checkRateLimit(ip);
+
+  if (!allowed) {
+    const message =
+      reason === "minute"
+        ? "Slow down — you're sending messages too quickly. Try again in a minute."
+        : "You've hit the hourly message limit. Come back in a little while.";
+    return new Response(JSON.stringify({ error: message }), {
+      status: 429,
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  const { message, sessionId, project = "general" } = parse.data;
-  const effectiveSessionId = sessionId || crypto.randomUUID();
+  const {
+    messages,
+    selectedModel,
+    sessionId,
+  }: { messages: UIMessage[]; selectedModel?: modelID; sessionId?: string } = await req.json();
 
-  const session = await manibotSessionManager.getOrCreateSession(
-    effectiveSessionId,
-    project
-  );
-
-  const history = session.messages.slice(-10);
+  const resolvedSessionId = sessionId ?? nanoid();
 
   let lastError: unknown = null;
 
+  // Try configured Groq models in order; ignore selectedModel for now
   for (const modelId of GROQ_MODELS) {
     try {
       const result = streamText({
-        model: groq(modelId),
-        system: `You are Mani, a concise, helpful assistant.`,
-        messages: [
-          ...history,
-          { role: "user", content: message },
-        ],
-        tools,
-        maxSteps: 3,
+        model: model.languageModel(modelId),
+        system: SYSTEM_PROMPT,
+        messages: convertToModelMessages(messages),
+        stopWhen: stepCountIs(5),
+        tools: {
+          getWeather: weatherTool,
+          kairosSearch: kairosSearchTool,
+        },
+        experimental_telemetry: {
+          isEnabled: false,
+        },
         onFinish: async ({ text }) => {
-          await manibotSessionManager.appendMessage(effectiveSessionId, {
-            role: "assistant",
-            content: text,
-          });
+          try {
+            const persisted: ManiMessage[] = [
+              ...messages
+                .filter((m) => m.role === "user" || m.role === "assistant")
+                .map((m) => ({
+                  id: m.id ?? nanoid(),
+                  role: m.role as "user" | "assistant",
+                  content: extractMessageText(m),
+                  createdAt: Date.now(),
+                })),
+              {
+                id: nanoid(),
+                role: "assistant" as const,
+                content: text,
+                createdAt: Date.now(),
+              },
+            ];
+
+            const title = deriveTitle(messages);
+            await upsertSession(resolvedSessionId, title, persisted);
+          } catch (err) {
+            console.error("[manibot] onFinish Firestore write failed:", err);
+          }
         },
       });
 
-      console.log("[mani-chat] model_success", { modelId, sessionId: effectiveSessionId });
+      console.log("[mani-chat] model_success", { modelId, sessionId: resolvedSessionId });
 
-      return result.toDataStreamResponse();
+      return result.toUIMessageStreamResponse({
+        sendReasoning: true,
+        onError: (error) => {
+          if (error instanceof Error) {
+            if (error.message.includes("Rate limit")) {
+              return "Rate limit exceeded. Please try again later.";
+            }
+          }
+          console.error(error);
+          return "An error occurred.";
+        },
+      });
     } catch (err) {
       lastError = err;
-      console.warn("[mani-chat] model_failed", { modelId, sessionId: effectiveSessionId, error: err });
+      console.warn("[mani-chat] model_failed", { modelId, sessionId: resolvedSessionId, error: err });
+      // continue to next model in fallback list
     }
   }
 
-  console.error("[mani-chat] all_models_failed", { sessionId: effectiveSessionId, lastError });
+  console.error("[mani-chat] all_models_failed", { sessionId: resolvedSessionId, lastError });
   return new Response(
     JSON.stringify({ error: "All configured models failed. Check Vercel logs for details." }),
     { status: 500, headers: { "Content-Type": "application/json" } }
