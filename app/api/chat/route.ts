@@ -1,4 +1,4 @@
-import { model, modelID } from "@/ai/providers";
+import { model, defaultModel } from "@/ai/providers";
 import { weatherTool, kairosSearchTool } from "@/ai/tools";
 import { convertToModelMessages, stepCountIs, streamText, UIMessage } from "ai";
 import { upsertSession } from "@/lib/manibot-session";
@@ -15,17 +15,6 @@ const SYSTEM_PROMPT = fs.readFileSync(
   "utf-8"
 );
 
-// Minimal fallback list of available Groq models (Aug–Sep 2026 catalog)
-const GROQ_MODELS: modelID[] = [
-  "meta-llama/llama-3.3-70b-versatile",
-  "qwen/qwen-3.5-32b",
-  "openai/gpt-oss-20b",
-];
-
-// ---------------------------------------------------------------------------
-// In-memory rate limiter
-// ---------------------------------------------------------------------------
-
 const RATE_LIMIT_PER_MINUTE = 10;
 const RATE_LIMIT_PER_HOUR = 60;
 const ONE_MINUTE_MS = 60 * 1000;
@@ -39,11 +28,8 @@ interface RateEntry {
 const rateLimitMap = new Map<string, RateEntry>();
 
 function getIP(req: NextRequest): string {
-  return (
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-    req.headers.get("x-real-ip") ??
-    "unknown"
-  );
+  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    req.headers.get("x-real-ip") ?? "unknown";
 }
 
 function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
@@ -52,29 +38,23 @@ function checkRateLimit(ip: string): { allowed: boolean; reason?: string } {
     minute: { count: 0, windowStart: now },
     hour: { count: 0, windowStart: now },
   };
-
   if (now - entry.minute.windowStart > ONE_MINUTE_MS) {
     entry.minute = { count: 0, windowStart: now };
   }
-
   if (now - entry.hour.windowStart > ONE_HOUR_MS) {
     entry.hour = { count: 0, windowStart: now };
   }
-
   if (entry.minute.count >= RATE_LIMIT_PER_MINUTE) {
     rateLimitMap.set(ip, entry);
     return { allowed: false, reason: "minute" };
   }
-
   if (entry.hour.count >= RATE_LIMIT_PER_HOUR) {
     rateLimitMap.set(ip, entry);
     return { allowed: false, reason: "hour" };
   }
-
   entry.minute.count++;
   entry.hour.count++;
   rateLimitMap.set(ip, entry);
-
   return { allowed: true };
 }
 
@@ -84,23 +64,14 @@ function maybePrune() {
   pruneCounter = 0;
   const now = Date.now();
   for (const [ip, entry] of rateLimitMap.entries()) {
-    if (
-      now - entry.minute.windowStart > ONE_MINUTE_MS &&
-      now - entry.hour.windowStart > ONE_HOUR_MS
-    ) {
+    if (now - entry.minute.windowStart > ONE_MINUTE_MS &&
+        now - entry.hour.windowStart > ONE_HOUR_MS) {
       rateLimitMap.delete(ip);
     }
   }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-interface TextPart {
-  type: string;
-  text?: string;
-}
+interface TextPart { type: string; text?: string; }
 
 function extractTextFromParts(parts: TextPart[]): string {
   return parts.filter((p) => p.type === "text").map((p) => p.text ?? "").join("");
@@ -114,105 +85,67 @@ function deriveTitle(messages: UIMessage[]): string {
 }
 
 function extractMessageText(m: UIMessage): string {
-  if (Array.isArray(m.parts)) {
-    return extractTextFromParts(m.parts as TextPart[]);
-  }
-  return "";
+  return Array.isArray(m.parts) ? extractTextFromParts(m.parts as TextPart[]) : "";
 }
-
-// ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
   const ip = getIP(req);
   maybePrune();
   const { allowed, reason } = checkRateLimit(ip);
-
   if (!allowed) {
-    const message =
-      reason === "minute"
-        ? "Slow down — you're sending messages too quickly. Try again in a minute."
-        : "You've hit the hourly message limit. Come back in a little while.";
+    const message = reason === "minute"
+      ? "Slow down — you're sending messages too quickly. Try again in a minute."
+      : "You've hit the hourly message limit. Come back in a little while.";
     return new Response(JSON.stringify({ error: message }), {
-      status: 429,
-      headers: { "Content-Type": "application/json" },
+      status: 429, headers: { "Content-Type": "application/json" },
     });
   }
 
-  const {
-    messages,
-    sessionId,
-  }: { messages: UIMessage[]; sessionId?: string } = await req.json();
-
+  const { messages, sessionId }: { messages: UIMessage[]; sessionId?: string } = await req.json();
   const resolvedSessionId = sessionId ?? nanoid();
+  const modelId = defaultModel;
 
-  let lastError: unknown = null;
+  try {
+    const result = streamText({
+      model: model.languageModel(modelId),
+      system: `${SYSTEM_PROMPT}\n\nRuntime metadata supplied by the application:\nHarness: Manibot (Manitec custom Next.js app).\nProvider: Groq.\nConfigured model ID: ${modelId}.\nExact underlying model revision: not supplied; leave model_version blank when asked.\nTools exposed to this chat: getWeather and kairosSearch. Availability does not prove a connection has been tested.\nConversation persistence is handled by the application; it is not a general-purpose database tool. Do not infer other connections from project descriptions.`,
+      messages: await convertToModelMessages(messages),
+      stopWhen: stepCountIs(5),
+      tools: { getWeather: weatherTool, kairosSearch: kairosSearchTool },
+      experimental_telemetry: { isEnabled: false },
+      onFinish: async ({ text }) => {
+        console.log("[mani-chat] generation_finished", { modelId, sessionId: resolvedSessionId });
+        try {
+          const persisted: ManiMessage[] = [
+            ...messages.filter((m) => m.role === "user" || m.role === "assistant").map((m) => ({
+              id: m.id ?? nanoid(),
+              role: m.role as "user" | "assistant",
+              content: extractMessageText(m),
+              createdAt: Date.now(),
+            })),
+            { id: nanoid(), role: "assistant" as const, content: text, createdAt: Date.now() },
+          ];
+          await upsertSession(resolvedSessionId, deriveTitle(messages), persisted);
+        } catch (err) {
+          console.error("[manibot] onFinish Firestore write failed:", err);
+        }
+      },
+    });
 
-  // Try configured Groq models in order
-  for (const modelId of GROQ_MODELS) {
-    try {
-      const result = streamText({
-        model: model.languageModel(modelId),
-        system: SYSTEM_PROMPT,
-        messages: convertToModelMessages(messages),
-        stopWhen: stepCountIs(5),
-        tools: {
-          getWeather: weatherTool,
-          kairosSearch: kairosSearchTool,
-        },
-        experimental_telemetry: {
-          isEnabled: false,
-        },
-        onFinish: async ({ text }) => {
-          try {
-            const persisted: ManiMessage[] = [
-              ...messages
-                .filter((m) => m.role === "user" || m.role === "assistant")
-                .map((m) => ({
-                  id: m.id ?? nanoid(),
-                  role: m.role as "user" | "assistant",
-                  content: extractMessageText(m),
-                  createdAt: Date.now(),
-                })),
-              {
-                id: nanoid(),
-                role: "assistant" as const,
-                content: text,
-                createdAt: Date.now(),
-              },
-            ];
-
-            const title = deriveTitle(messages);
-            await upsertSession(resolvedSessionId, title, persisted);
-          } catch (err) {
-            console.error("[manibot] onFinish Firestore write failed:", err);
-          }
-        },
-      });
-
-      console.log("[mani-chat] model_success", { modelId, sessionId: resolvedSessionId });
-
-      return result.toUIMessageStreamResponse({
-        sendReasoning: true,
-        onError: (error) => {
-          if (error instanceof Error) {
-            if (error.message.includes("Rate limit")) {
-              return "Rate limit exceeded. Please try again later.";
-            }
-          }
-          console.error(error);
-          return "An error occurred.";
-        },
-      });
-    } catch (err) {
-      lastError = err;
-      console.warn("[mani-chat] model_failed", { modelId, sessionId: resolvedSessionId, error: err });
-      // continue to next model in fallback list
-    }
+    return result.toUIMessageStreamResponse({
+      sendReasoning: true,
+      onError: (error) => {
+        console.error("[mani-chat] stream_failed", { modelId, sessionId: resolvedSessionId, error });
+        if (error instanceof Error && error.message.includes("Rate limit")) {
+          return "Rate limit exceeded. Please try again later.";
+        }
+        return "Mani could not complete the response. Check the server logs for details.";
+      },
+    });
+  } catch (error) {
+    console.error("[mani-chat] request_failed", { modelId, sessionId: resolvedSessionId, error });
+    return new Response(JSON.stringify({ error: "The configured model could not start. Check server logs for details." }), {
+      status: 500, headers: { "Content-Type": "application/json" },
+    });
   }
-
-  console.error("[mani-chat] all_models_failed", { sessionId: resolvedSessionId, lastError });
-  return new Response(
-    JSON.stringify({ error: "All configured models failed. Check Vercel logs for details." }),
-    { status: 500, headers: { "Content-Type": "application/json" } }
-  );
 }
