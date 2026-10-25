@@ -1,181 +1,142 @@
-# 🤖 ManiBot
+# ManiBot
 
-**ManiBot** is the public-facing AI for the [Manitec](https://manitec.pw) brand — a streaming chatbot built with Next.js, the Vercel AI SDK (v5), and Groq. It lives at [chat.manitec.pw](https://chat.manitec.pw).
+ManiBot (Mani) is Manitec's custom streaming chat application, built with Next.js, the Vercel AI SDK, and Groq. The project documents its public address as https://chat.manitec.pw.
 
-ManiBot handles general-purpose AI conversations on behalf of the Manitec brand: helping users, answering questions, and representing the public voice of the empire. It is not an internal tool — that's what HexBot is for.
-
----
+This README describes repository behavior, not a guarantee that production credentials, tools, or persistence have passed a live test.
 
 ## Stack
 
-| Layer | Tech |
+- Next.js 15 App Router, React 19, TypeScript.
+- Vercel AI SDK 5 beta and Groq provider SDK 2 beta; see package.json for pinned versions.
+- Tailwind CSS 4 and shadcn/ui components.
+- Firebase Admin SDK / Firestore for chat sessions.
+- Shared-password cookie gate.
+- pnpm; Vercel deployment.
+
+## Models and routing
+
+All registered models use Groq. The default is `openai/gpt-oss-20b`.
+
+| Registered model ID | Role |
 |---|---|
-| Framework | Next.js 15 (App Router, Turbopack) |
-| AI SDK | [Vercel AI SDK v5](https://sdk.vercel.ai) |
-| AI Provider | [Groq](https://groq.com) |
-| UI | shadcn/ui + Tailwind CSS v4 |
-| Database | [Neon](https://neon.tech) (serverless Postgres) |
-| Auth | Cookie-based gate (`GATE_PASSWORD`) |
-| Deploy | [Vercel](https://vercel.com) |
-| Package Manager | pnpm |
+| `openai/gpt-oss-20b` | Default used by the chat route |
+| `llama-3.3-70b-versatile` | Registered alternative |
+| `llama-3.1-8b-instant` | Registered alternative |
 
----
+`ai/providers.ts` is the source of truth for registrations, `MODELS`, and `defaultModel`. `app/api/chat/route.ts` uses that shared default. There is no automatic cross-model fallback. A frontend selector does not change the backend model unless the route explicitly accepts and validates that choice.
 
-## Models
+Provider availability and account access can change. Verify model IDs against Groq's catalog before changing configuration.
 
-All models are served through Groq. The **default model is `kimi-k2`**.
+## Chat behavior
 
-| Model ID | Notes |
+- Streams responses through `POST /api/chat`.
+- Loads identity and behavior instructions from `prompts/manibot-system.md`.
+- Appends application-supplied runtime metadata: harness, provider, configured model ID, and exposed tool names.
+- Leaves the exact model revision unspecified; it should not be guessed.
+- Allows up to five generation/tool steps per request.
+- Uses a 60-second route duration setting.
+- Applies in-memory, per-IP limits of 10 requests/minute and 60/hour. These are per-process controls, not distributed rate limiting.
+- Attempts to save the conversation after generation finishes. A successful response does not by itself prove persistence succeeded.
+
+## Tools
+
+| Tool | Actual behavior |
 |---|---|
-| `kimi-k2` ⭐ | Moonshot AI — default |
-| `meta-llama/llama-4-scout-17b-16e-instruct` | Llama 4 Scout |
-| `llama-3.1-8b-instant` | Fast, lightweight |
-| `deepseek-r1-distill-llama-70b` | Reasoning model (chain-of-thought) |
-| `llama-3.3-70b-versatile` | Strong general-purpose model |
+| `kairosSearch` | Calls Kairos `/api/search`, then `/api/answer`, returning an answer and sources or an error. Requires a working Kairos service. |
+| `getWeather` | Demo that returns a randomly generated temperature. Not a live weather service; do not use it as factual weather evidence. |
 
-Models are configured in [`ai/providers.ts`](./ai/providers.ts).
+Tools are defined in `ai/tools.ts` and exposed by the chat route. Backend session storage is not a general-purpose database tool available to the model. No email or FleetRegistry tool is exposed by this route.
 
----
+## Session persistence
 
-## Features
+`lib/manibot-session.ts` stores sessions in Firestore collection `manibot_sessions`. Each document holds its ID, title, messages, and creation/update timestamps. Message arrays retain at most the latest 200 messages; session listing returns up to 50 sessions.
 
-- **Streaming responses** powered by Vercel AI SDK
-- **Session persistence** — chat history saved to Neon Postgres per session
-- **Multi-model selector** — switch between Groq models in the UI
-- **Reasoning support** — DeepSeek R1 sends chain-of-thought reasoning blocks
-- **PWA support** — installable on Android/iOS, offline page, TWA-ready
-- **Mobile-first** — collapsible sidebar, `100dvh` layout, hamburger toggle
-- **Branded system prompt** — loaded from [`prompts/manibot-system.md`](./prompts/manibot-system.md)
-- **Cookie-based auth gate** — protects the UI, login page excluded
-- **Weather tool** — example tool integration via `ai/tools.ts`
+Firebase Admin credentials are read by `lib/firebase-admin.ts`. If they are missing, storage helpers return without writing and emit a warning. Write failures during chat completion are logged. Test both saving and reloading history before relying on persistence.
 
----
+The active session implementation uses Firestore, not Neon Postgres.
 
-## Project Structure
-
-```
-manibot/
-├── ai/
-│   ├── providers.ts         # Groq model registry + default
-│   └── tools.ts             # AI tool definitions (weather, etc.)
-├── app/
-│   ├── api/
-│   │   ├── chat/            # POST /api/chat — main streaming endpoint
-│   │   ├── login/           # POST /api/login — sets auth cookie
-│   │   ├── messages/        # GET/POST /api/messages
-│   │   └── sessions/        # GET/POST/DELETE /api/sessions
-│   ├── login/               # Login page
-│   └── page.tsx             # Main chat UI
-├── components/              # shadcn/ui components
-├── docs/                    # Internal documentation
-├── lib/
-│   ├── db.ts                # Neon Postgres client + queries
-│   └── hooks/               # Custom React hooks
-├── prompts/
-│   └── manibot-system.md    # ManiBot's system prompt (edit this to change behavior)
-├── public/                  # Static assets, PWA icons, manifest, service worker
-├── middleware.ts            # Auth gate — protects all routes except /login + assets
-└── instrumentation.ts       # OpenTelemetry setup
-```
-
----
-
-## Local Setup
-
-### 1. Clone & install
+## Local setup
 
 ```bash
-git clone https://github.com/Manitec/manibot.git
+git clone https://github.com/Manitec-HQ/manibot.git
 cd manibot
 pnpm install
-```
-
-### 2. Set up environment variables
-
-Copy the example and fill in your values:
-
-```bash
 cp .env.example .env.local
 ```
 
-Required variables:
+The example environment file may lag implementation. Configure these variables according to the code:
 
 ```env
-GROQ_API_KEY=          # Your Groq API key — https://console.groq.com
-DATABASE_URL=          # Neon Postgres connection string
-GATE_PASSWORD=         # Password for the ManiBot login gate
+# Chat generation and shared-password login
+GROQ_API_KEY=
+GATE_PASSWORD=
+
+# Required for Firestore session persistence
+FIREBASE_ADMIN_PROJECT_ID=
+FIREBASE_ADMIN_CLIENT_EMAIL=
+FIREBASE_ADMIN_PRIVATE_KEY=
+
+# Optional override for the Kairos service
+KAIROS_URL=
 ```
 
-> **Tip:** If you have the [Vercel CLI](https://vercel.com/docs/cli) installed and this project linked, you can pull env vars directly:
-> ```bash
-> vercel link
-> vercel env pull
-> ```
+The private-key loader converts escaped `\n` sequences to newlines. Keep service-account credentials server-side; never commit them or expose them through `NEXT_PUBLIC_` variables.
 
-### 3. Initialize the database
-
-The DB schema is auto-created on first request via `initDB()` in `lib/db.ts`. No manual migration needed.
-
-### 4. Run the dev server
+If `KAIROS_URL` is unset, the search tool currently uses `https://kairos-orcin-eight.vercel.app`. This default is not a guarantee of service availability.
 
 ```bash
 pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) and log in with your `GATE_PASSWORD`.
+Open http://localhost:3000 and use the configured gate password. Session documents are created by application writes; no Neon initialization or SQL migration is part of this session path.
 
----
+## Build and deployment
 
-## Deployment
+```bash
+pnpm exec tsc --noEmit
+pnpm build
+```
 
-ManiBot deploys automatically to Vercel on every push to `main`.
+The repository is connected to the Vercel project `mani_bot`; pushes to `main` can trigger production builds. Configure server environment variables in the appropriate Vercel environment.
 
-- **Production URL:** [chat.manitec.pw](https://chat.manitec.pw)
-- **Vercel Project:** [vercel.com/manitecs-projects/mani_bot](https://vercel.com/manitecs-projects/mani_bot)
-- **Vercel Team:** manitec's projects
+After deploying, verify a completed chat response, Kairos tool behavior, and saving/reloading a session. Check server logs for failures. A completed build alone does not verify those integrations.
 
-Required environment variables on Vercel: `GROQ_API_KEY`, `DATABASE_URL`, `GATE_PASSWORD`.
+The system-prompt file is read on the server. On Vercel, deploy the changed file to update the running application; editing GitHub does not hot-update an existing deployment.
 
----
+## Authentication boundary
+
+`middleware.ts` uses a shared-password cookie gate, with exclusions for login and selected assets. It is not individual-user authentication, role-based authorization, or per-user session isolation. Do not treat it as a complete multi-user security model.
+
+## FleetRegistry
+
+Mani can be asked to draft a JSON summary for manual review and pasting into FleetRegistry. That does not install a relay, send a heartbeat, upload files, or connect this application to FleetRegistry.
+
+For a summary, report the application harness and configured model, leave unknown revisions blank, distinguish exposed tools from tested connections, and leave `acts` empty when requested. Never include credentials or personal conversation data.
+
+## Project layout
+
+```text
+ai/providers.ts             Groq registrations and shared default
+ai/tools.ts                 Kairos search and demo weather tool
+app/api/chat/route.ts        Streaming generation and completion save
+app/api/login/              Login endpoint
+app/api/messages/           Message endpoints
+app/api/sessions/           Session endpoints
+lib/firebase-admin.ts       Server-side Firebase initialization
+lib/manibot-session.ts      Firestore session helpers
+prompts/manibot-system.md   Identity and behavior instructions
+components/                 UI components
+public/                     Static and PWA assets
+middleware.ts               Shared-password gate
+```
 
 ## Customization
 
-### Changing ManiBot's personality or behavior
+- Identity/behavior: edit `prompts/manibot-system.md` and redeploy.
+- Default model: register an exact Groq model ID in `ai/providers.ts` and update `defaultModel`.
+- Tools: define a tool in `ai/tools.ts`, register it in the route, and keep runtime metadata consistent.
+- Model selection: validate client selections against registered IDs before adding backend selection support.
 
-Edit [`prompts/manibot-system.md`](./prompts/manibot-system.md). This file is loaded at runtime by the chat API route. No rebuild needed — just push the change.
+## Contribution
 
-### Adding a new AI model
-
-Add the model to the `languageModels` map in [`ai/providers.ts`](./ai/providers.ts):
-
-```ts
-"my-new-model": groq("model-id-from-groq"),
-```
-
-It will automatically appear in the model selector UI.
-
-### Adding a new AI tool
-
-Define the tool in [`ai/tools.ts`](./ai/tools.ts) and register it in the `tools` object in [`app/api/chat/route.ts`](./app/api/chat/route.ts).
-
----
-
-## Related Projects
-
-| Project | Description | Repo |
-|---|---|---|
-| **HexBot** | Internal-ops AI (admin/dev-facing) | Private |
-| **Manitec Command Hub** | FastAPI orchestration API (KB, tasks, deploy triggers) | Private |
-| **Manitec Control Hub** | Internal dashboard | Private |
-| **Banjoshire** | Social chat app — Discord-style community platform | [banjoshire.vercel.app](https://banjoshire.vercel.app) |
-| **Joe's Faves** | Personal hub & project index | [joesfaves.com](https://joesfaves.com) |
-
----
-
-## Contributing
-
-This is a Manitec internal project. Issues and PRs from the team are welcome. External contributions are not currently accepted.
-
----
-
-*Built by [Manitec](https://manitec.pw)*
+A Manitec project. Coordinate changes with the repository owner. Keep credentials out of code, documentation, issues, and logs.
